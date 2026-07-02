@@ -1065,6 +1065,7 @@ pub async fn connect_db(
     config: ConnectionConfig,
     client_attempt: Option<u64>,
 ) -> Result<String, String> {
+    let started_at = std::time::Instant::now();
     let config = config.canonicalized();
     if config.db_type == DatabaseType::Sqlite {
         db::sqlite::validate_persistent_attachments(
@@ -1083,6 +1084,15 @@ pub async fn connect_db(
     state.reset_connection_transport_for_config(&id, &db_config).await;
 
     let (host, port) = state.connection_host_port(&id, &db_config).await?;
+    log::info!(
+        "[connect_db:start] connection_id={} attempt={} db_type={:?} target={}:{} timeout_ms={}",
+        id,
+        attempt,
+        db_config.db_type,
+        host,
+        port,
+        db_config.effective_connect_timeout_secs() * 1000
+    );
     if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
         state.reset_connection_transport_for_config(&id, &db_config).await;
         return Err(err);
@@ -1351,6 +1361,12 @@ pub async fn connect_db(
         DatabaseType::Jdbc => state.external_driver_pool("jdbc", &db_config).await?,
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
+    log::debug!(
+        "[connect_db:pool-ready] connection_id={} attempt={} elapsed_ms={}",
+        id,
+        attempt,
+        started_at.elapsed().as_millis()
+    );
 
     if let Err(err) =
         state.insert_connection_pool_for_attempt(&id, attempt, id.clone(), pool, &connected_db_config).await
@@ -1359,6 +1375,12 @@ pub async fn connect_db(
         return Err(err);
     }
     state.configs.write().await.insert(id.clone(), connected_config);
+    log::info!(
+        "[connect_db:done] connection_id={} attempt={} elapsed_ms={}",
+        id,
+        attempt,
+        started_at.elapsed().as_millis()
+    );
 
     Ok(id)
 }

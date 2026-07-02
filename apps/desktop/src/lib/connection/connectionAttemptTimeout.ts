@@ -5,6 +5,7 @@ export const MONGO_LEGACY_FALLBACK_TIMEOUT_BUFFER_MS = 30_000;
 export const AGENT_DRIVER_MIN_CONNECT_TIMEOUT_SECS = 30;
 export const ACCESS_AGENT_MIN_CONNECT_TIMEOUT_SECS = 30;
 const DEFAULT_CONNECT_TIMEOUT_SECS = 10;
+const NATIVE_MYSQL_CONNECT_ATTEMPT_MULTIPLIER = 2;
 
 const DRIVER_STARTUP_FLOOR_TYPES = new Set<DatabaseType>([
   "dameng",
@@ -65,7 +66,11 @@ function resolvedTimeoutLayer(layer: TransportLayerConfig, resolveTunnelProfile?
 export function connectionAttemptTimeoutMs(config: Pick<ConnectionConfig, "connect_timeout_secs" | "transport_layers"> & Partial<Pick<ConnectionConfig, "db_type">>, resolveTunnelProfile?: TunnelProfileResolver): number {
   const baseTimeoutSecs = positiveSeconds(config.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
   const agentMinTimeoutSecs = config.db_type === "access" ? ACCESS_AGENT_MIN_CONNECT_TIMEOUT_SECS : AGENT_DRIVER_MIN_CONNECT_TIMEOUT_SECS;
-  const timeouts = [DRIVER_STARTUP_FLOOR_TYPES.has(config.db_type as DatabaseType) ? Math.max(baseTimeoutSecs, agentMinTimeoutSecs) : baseTimeoutSecs];
+  // Native MySQL may retry once with a compatible setup/default-database or TLS
+  // fallback. Its configured timeout applies to each backend attempt, so the UI
+  // must not declare failure while that bounded fallback is still in progress.
+  const nativeMysqlTimeoutSecs = config.db_type === "mysql" ? baseTimeoutSecs * NATIVE_MYSQL_CONNECT_ATTEMPT_MULTIPLIER : baseTimeoutSecs;
+  const timeouts = [DRIVER_STARTUP_FLOOR_TYPES.has(config.db_type as DatabaseType) ? Math.max(baseTimeoutSecs, agentMinTimeoutSecs) : nativeMysqlTimeoutSecs];
   for (const unresolvedLayer of config.transport_layers ?? []) {
     const layer = resolvedTimeoutLayer(unresolvedLayer, resolveTunnelProfile);
     if (layer.enabled === false) continue;

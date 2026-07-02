@@ -74,6 +74,7 @@ import {
   canCreateDatabaseNodeNamespace,
   canEditDatabaseProperties as canEditDatabasePropertiesForNode,
   connectionNamespaceCreationTarget,
+  connectionSupportsDatabaseSize,
   editableDatabasePropertyGroups,
   supportsDatabaseCreation,
   supportsDatabaseSearch,
@@ -324,6 +325,7 @@ const emit = defineEmits<{
 const {
   setNodeAsDefaultDatabase,
   clearNodeDefaultDatabase,
+  fetchDatabaseSize,
   connectionDeleteMenuLabel,
   connectionDuplicateMenuLabel,
   connectionDeleteConfirmMessage,
@@ -2097,6 +2099,12 @@ const canEditDatabaseProperties = computed(() => {
   return canEditDatabasePropertiesForNode(config, activeNode.value) && !isSqlServerLinkedNode(activeNode.value);
 });
 
+const canFetchDatabaseSize = computed(() => {
+  if (activeNode.value.type !== "database" || activeNode.value.catalog) return false;
+  const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
+  return connectionSupportsDatabaseSize(config);
+});
+
 const canEditDatabaseCharsetCollation = computed(() => databasePropertyGroups.value.includes("charsetCollation"));
 
 const canEditDatabaseComment = computed(() => databasePropertyGroups.value.includes("databaseComment"));
@@ -3711,6 +3719,9 @@ function buildDatabaseSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       } else {
         items.push({ label: t("contextMenu.clearDefaultDatabase"), action: clearNodeDefaultDatabase, icon: Database });
       }
+    }
+    if (canFetchDatabaseSize.value) {
+      items.push({ label: t("contextMenu.fetchDatabaseSize"), action: fetchDatabaseSize, icon: Database });
     }
     if (canEditDatabaseProperties.value) {
       items.push({ label: t("contextMenu.editDatabaseProperties"), action: openEditDatabasePropertiesDialog, icon: SquarePen });

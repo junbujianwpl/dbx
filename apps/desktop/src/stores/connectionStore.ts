@@ -11,6 +11,7 @@ import type {
   DatabaseConnectionInfo,
   DatabaseStorageInfo,
   CatalogInfo,
+  DatabaseStatistics,
   ForeignKeyInfo,
   ObjectInfo,
   ObjectStatistics,
@@ -60,7 +61,7 @@ import { mergeSqlObjectNavigationType, sqlObjectNavigationTypeFromTableType } fr
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
-import { connectionIsDorisFamilyCatalogCapable, isInternalDorisCatalog, isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
+import { connectionIsDorisFamilyCatalogCapable, connectionSupportsDatabaseSize, isInternalDorisCatalog, isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
 import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionShouldDiscoverJdbcSchemas, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, compareSidebarNames, sortSidebarDatabases, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/database/databaseTree";
 import { buildSqlServerDatabaseTreeNodes } from "@/lib/database/sqlServerTree";
@@ -127,6 +128,12 @@ const DEFAULT_KEEPALIVE_INTERVAL_SECS = 30;
 const METADATA_LIST_PAGE_CACHE_TTL_MS = 30_000;
 const METADATA_LIST_PAGE_CACHE_MAX_ENTRIES = 160;
 const SIDEBAR_DATABASE_STORAGE_CACHE_TTL_MS = 30_000;
+const DATABASE_STATISTICS_CACHE_TTL_MS = 5 * 60_000;
+const DATABASE_STATISTICS_CACHE_MAX_ENTRIES = 64;
+const DATABASE_STATISTICS_TIMEOUT_MS = 10_000;
+// Manual, single-database size fetch (right-click). One schema is much cheaper
+// than the automatic all-database pass, so it gets a far more generous budget.
+const MANUAL_DATABASE_SIZE_TIMEOUT_MS = 60_000;
 export const COMPLETION_METADATA_CONCURRENCY = 2;
 const MONGO_LEGACY_DRIVER_PROFILE = "mongodb-legacy";
 const MONGO_LEGACY_DRIVER_LABEL = "MongoDB (Legacy)";
@@ -411,6 +418,10 @@ export const useConnectionStore = defineStore("connection", () => {
   const metadataListPageCache = new MetadataResultCache<MetadataListPageResult>({
     ttlMs: METADATA_LIST_PAGE_CACHE_TTL_MS,
     maxEntries: METADATA_LIST_PAGE_CACHE_MAX_ENTRIES,
+  });
+  const databaseStatisticsCache = new MetadataResultCache<DatabaseStatistics[]>({
+    ttlMs: DATABASE_STATISTICS_CACHE_TTL_MS,
+    maxEntries: DATABASE_STATISTICS_CACHE_MAX_ENTRIES,
   });
   const metadataTraceLogger: MetadataLoadTraceLogger = (event) => {
     console.debug("[DBX][metadata-load:trace]", event);
@@ -828,6 +839,38 @@ export const useConnectionStore = defineStore("connection", () => {
       ]);
       clearConnectionErrorIfUnchanged(connectionId, errorRevision);
       return result;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function withDatabaseStatisticsTimeout<T>(promise: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Connection timed out while loading database statistics after ${Math.ceil(DATABASE_STATISTICS_TIMEOUT_MS / 1000)}s.`));
+          }, DATABASE_STATISTICS_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function withDatabaseSizeTimeout<T>(promise: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Timed out while fetching database size after ${Math.ceil(MANUAL_DATABASE_SIZE_TIMEOUT_MS / 1000)}s.`));
+          }, MANUAL_DATABASE_SIZE_TIMEOUT_MS);
+        }),
+      ]);
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -1378,8 +1421,138 @@ export const useConnectionStore = defineStore("connection", () => {
     };
   }
 
+  function supportsAsyncDatabaseStatistics(config?: ConnectionConfig): boolean {
+    // Native Postgres (non-Cockroach) loads database sizes via listDatabaseStorage
+    // (visible-database scoped). Keep the statistics path for MySQL and
+    // Postgres-family forks that storage does not cover.
+    if (supportsSidebarDatabaseStorage(config)) return false;
+    return connectionSupportsDatabaseSize(config);
+  }
+
+  function databaseStatisticsCacheScope(connectionId: string): MetadataScopeInput {
+    return {
+      kind: "database-statistics",
+      connectionId,
+      driverProfile: metadataDriverProfile(getConfig(connectionId)),
+    };
+  }
+
+  async function loadDatabaseStatisticsCached(connectionId: string, options?: { force?: boolean }): Promise<DatabaseStatistics[]> {
+    const scope = databaseStatisticsCacheScope(connectionId);
+    if (!options?.force) {
+      const cached = databaseStatisticsCache.get(scope);
+      if (cached) return cached.value;
+    }
+    return runTreeMetadataLoad(
+      scope,
+      async () => {
+        if (!connectedIds.value.has(connectionId)) return [];
+        if (!options?.force) {
+          const cached = databaseStatisticsCache.get(scope);
+          if (cached) return cached.value;
+        }
+        console.debug("[DBX][database-statistics:start]", { connectionId, force: options?.force === true });
+        const startedAt = Date.now();
+        const statistics = await withDatabaseStatisticsTimeout(api.listDatabaseStatistics(connectionId));
+        databaseStatisticsCache.set(scope, statistics);
+        console.debug("[DBX][database-statistics:done]", {
+          connectionId,
+          resultCount: statistics.length,
+          elapsedMs: Date.now() - startedAt,
+        });
+        return statistics;
+      },
+      // A forced tree refresh should bypass the cached value, but it must not
+      // start a second expensive statistics query while one is already active.
+      { ...options, force: false },
+    );
+  }
+
+  function applyDatabaseSizeToConnectionTree(connectionId: string, database: string, sizeBytes: number | null, options?: { allowClear?: boolean }): boolean {
+    const connectionNode = findNode(treeNodes.value, connectionId);
+    if (!connectionNode?.children) return false;
+    let changed = false;
+    const nextChildren = connectionNode.children.map((child) => {
+      if (child.type !== "database" || child.catalog || child.database !== database) return child;
+      if (sizeBytes === null && child.sizeBytes != null && !options?.allowClear) return child;
+      if (child.sizeBytes === sizeBytes) return child;
+      changed = true;
+      // Replace the node object so virtualized TreeItem rows (shallowRef + recycle
+      // scroller keyed by id) pick up the new sizeBytes.
+      return { ...child, sizeBytes };
+    });
+    if (!changed) return false;
+    connectionNode.children = nextChildren;
+    return true;
+  }
+
+  function applyDatabaseStatisticsToConnectionTree(connectionId: string, statistics: readonly DatabaseStatistics[]): boolean {
+    const connectionNode = findNode(treeNodes.value, connectionId);
+    if (!connectionNode?.children) return false;
+
+    const sizeByDatabase = new Map(statistics.map((entry) => [entry.name, entry.size_bytes ?? null] as const));
+    let changed = false;
+    const nextChildren = connectionNode.children.map((child) => {
+      if (child.type !== "database" || child.catalog || child.database == null || !sizeByDatabase.has(child.database)) return child;
+      const nextSize = sizeByDatabase.get(child.database) ?? null;
+      // Don't let an automatic pass that timed out (null) erase a size the user
+      // fetched manually via the right-click action. Only apply null when the
+      // node has no size yet.
+      if (nextSize === null && child.sizeBytes != null) return child;
+      if (child.sizeBytes === nextSize) return child;
+      changed = true;
+      return { ...child, sizeBytes: nextSize };
+    });
+    if (!changed) return false;
+    connectionNode.children = nextChildren;
+    return true;
+  }
+
+  async function fetchDatabaseSize(connectionId: string, database: string): Promise<number | null> {
+    // Backend returns null for timeout / missing privilege / unsupported driver.
+    // That is a successful "unavailable" result: leave the size blank, no toast.
+    // Only real transport/API failures should reject and surface fetchDatabaseSizeFailed.
+    const cacheKey = schemaCacheKey(connectionId, "databases-v2");
+    const size = await withDatabaseSizeTimeout(api.databaseSize(connectionId, database));
+    const connectionNode = findNode(treeNodes.value, connectionId);
+    if (size != null && applyDatabaseSizeToConnectionTree(connectionId, database, size) && connectionNode?.children) {
+      void savePersistedConnectionTreeChildren(cacheKey, connectionNode.children);
+    }
+    return size ?? null;
+  }
+
+  function scheduleDatabaseStatisticsLoad(connectionId: string, cacheKey: string, options?: { force?: boolean }) {
+    if (!supportsAsyncDatabaseStatistics(getConfig(connectionId))) return;
+    // Plain setTimeout: this store also runs under Node/Vitest where `window`
+    // does not exist.
+    setTimeout(() => {
+      if (!connectedIds.value.has(connectionId)) return;
+      void loadDatabaseStatisticsCached(connectionId, options)
+        .then((statistics) => {
+          if (statistics.length === 0) return;
+          if (!applyDatabaseStatisticsToConnectionTree(connectionId, statistics)) return;
+          const node = findNode(treeNodes.value, connectionId);
+          if (node?.children) {
+            void savePersistedConnectionTreeChildren(cacheKey, node.children);
+          }
+        })
+        .catch((error) => {
+          console.warn("[DBX][database-statistics:load-failed]", { connectionId, error });
+        });
+    }, 0);
+  }
+
   function invalidateMetadataCaches(match: MetadataCacheInvalidation): number {
-    return metadataListPageCache.invalidate(match) + invalidateTableMetadataCache(match);
+    let removed = metadataListPageCache.invalidate(match) + invalidateTableMetadataCache(match);
+    if (match.connectionId) {
+      removed += databaseStatisticsCache.invalidate({
+        kind: "database-statistics",
+        connectionId: match.connectionId,
+      });
+    } else {
+      removed += databaseStatisticsCache.invalidate(match);
+    }
+    return removed;
   }
 
   function invalidateMetadataCachesByTreePrefix(prefix: string) {
@@ -2563,7 +2736,9 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function loadSidebarDatabaseStorage(connectionId: string, options?: { force?: boolean }): Promise<void> {
-    if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size" || !connectedIds.value.has(connectionId)) return;
+    // Database-level sizes are part of the always-on sidebar product (not gated by
+    // sidebarObjectInfoMode). Table sizes remain mode-gated in loadSidebarTableStorage.
+    if (!connectedIds.value.has(connectionId)) return;
     if (!supportsSidebarDatabaseStorage(getConfig(connectionId))) return;
     const connectionNode = findConnectionNode(connectionId);
     const databases = sidebarDatabaseNames(connectionNode?.children);
@@ -2572,7 +2747,9 @@ export const useConnectionStore = defineStore("connection", () => {
     const requestKey = sidebarDatabaseStorageRequestKey(connectionId, databases);
     const cached = sidebarDatabaseStorageCache.get(requestKey);
     if (!options?.force && cached && cached.expiresAt > Date.now()) {
-      applySidebarDatabaseStorage(connectionNode?.children, cached.value);
+      if (applySidebarDatabaseStorage(connectionNode?.children, cached.value) && connectionNode?.children) {
+        connectionNode.children = connectionNode.children.slice();
+      }
       return;
     }
 
@@ -2590,7 +2767,9 @@ export const useConnectionStore = defineStore("connection", () => {
       const currentNode = findConnectionNode(connectionId);
       const currentNames = sidebarDatabaseNames(currentNode?.children);
       if (sidebarDatabaseStorageRequestKey(connectionId, currentNames) === requestKey) {
-        applySidebarDatabaseStorage(currentNode?.children, storage);
+        if (applySidebarDatabaseStorage(currentNode?.children, storage) && currentNode?.children) {
+          currentNode.children = currentNode.children.slice();
+        }
       }
     } catch (error) {
       console.debug("[DBX][sidebar-database-storage:unavailable]", { connectionId, error });
@@ -2637,7 +2816,6 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   const sidebarDatabaseStorageScope = computed(() => {
-    if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size") return "";
     return [...connectedIds.value]
       .filter((connectionId) => supportsSidebarDatabaseStorage(getConfig(connectionId)))
       .map((connectionId) => sidebarDatabaseStorageRequestKey(connectionId, sidebarDatabaseNames(findConnectionNode(connectionId)?.children)))
@@ -2648,12 +2826,25 @@ export const useConnectionStore = defineStore("connection", () => {
   watch(
     sidebarDatabaseStorageScope,
     () => {
-      if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size") return;
       for (const connectionId of connectedIds.value) {
         void loadSidebarDatabaseStorage(connectionId);
       }
     },
     { flush: "post" },
+  );
+
+  // When the user switches into size mode, refresh table storage and re-apply any
+  // already-cached database sizes so the sidebar updates immediately.
+  watch(
+    () => settingsStore.editorSettings.sidebarObjectInfoMode,
+    (mode) => {
+      if (mode !== "size") return;
+      for (const connectionId of connectedIds.value) {
+        void loadSidebarDatabaseStorage(connectionId, { force: true });
+        const cacheKey = schemaCacheKey(connectionId, "databases-v2");
+        scheduleDatabaseStatisticsLoad(connectionId, cacheKey, { force: true });
+      }
+    },
   );
 
   async function loadDatabases(connectionId: string, options?: LoadTreeOptions) {
@@ -2761,6 +2952,7 @@ export const useConnectionStore = defineStore("connection", () => {
               if (!options?.force) {
                 const cached = await loadPersistedTreeChildren(node, cacheKey);
                 if (cached.hit) {
+                  scheduleDatabaseStatisticsLoad(connectionId, cacheKey);
                   if (cached.isStale) refreshStaleTreeNode(node);
                   return;
                 }
@@ -2800,6 +2992,7 @@ export const useConnectionStore = defineStore("connection", () => {
               if (!canApplyTreeMetadataResult(node)) return;
               setChildren(node, children);
               await savePersistedConnectionTreeChildren(cacheKey, node.children || children);
+              scheduleDatabaseStatisticsLoad(connectionId, cacheKey, { force: options?.force });
             }
           }
           node.isExpanded = true;
@@ -6131,6 +6324,8 @@ export const useConnectionStore = defineStore("connection", () => {
     setDefaultDatabase,
     clearDefaultDatabase,
     isDefaultDatabase,
+    fetchDatabaseSize,
+    applyDatabaseStatisticsToConnectionTree,
     setVisibleDatabases,
     clearVisibleDatabases,
     ensureVisibleDatabase,

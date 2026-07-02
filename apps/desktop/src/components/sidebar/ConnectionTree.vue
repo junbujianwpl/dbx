@@ -423,6 +423,8 @@ function scheduleSidebarCommentLabelMeasure() {
 function sidebarNodeHasTrailingMetadata(node: TreeNode): boolean {
   const mode = settingsStore.editorSettings.sidebarObjectInfoMode;
   if (mode.startsWith("comment-") && sidebarTreeNodeComment(node)) return true;
+  // Database totals are always-on once loaded; table sizes follow the size mode.
+  if (node.type === "database" && !!formatSidebarObjectStorage(node.sizeBytes)) return true;
   return mode === "size" && sidebarStorageDisplayTypes.has(node.type) && !!formatSidebarObjectStorage(node.sizeBytes);
 }
 

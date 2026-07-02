@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import { ACCESS_AGENT_MIN_CONNECT_TIMEOUT_SECS, AGENT_DRIVER_MIN_CONNECT_TIMEOUT_SECS, connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs, CONNECTION_ATTEMPT_TIMEOUT_BUFFER_MS } from "@/lib/connection/connectionAttemptTimeout";
 
 describe("connectionAttemptTimeout", () => {
-  it("uses a 10s default for regular database connections", () => {
-    expect(connectionAttemptTimeoutMs({ db_type: "mysql", connect_timeout_secs: undefined, transport_layers: [] })).toBe(12_000);
+  it("allows one bounded native MySQL fallback before the UI times out", () => {
+    expect(connectionAttemptTimeoutMs({ db_type: "mysql", connect_timeout_secs: undefined, transport_layers: [] })).toBe(22_000);
+    expect(connectionAttemptTimeoutMs({ db_type: "mysql", connect_timeout_secs: 5, transport_layers: [] })).toBe(12_000);
   });
 
-  it("keeps explicit regular database timeout values", () => {
-    expect(connectionAttemptTimeoutMs({ db_type: "mysql", connect_timeout_secs: 5, transport_layers: [] })).toBe(7_000);
+  it("keeps the configured timeout for regular single-attempt databases", () => {
+    expect(connectionAttemptTimeoutMs({ db_type: "postgres", connect_timeout_secs: 5, transport_layers: [] })).toBe(7_000);
   });
 
   it("uses a 30s agent startup floor", () => {
@@ -118,7 +119,7 @@ describe("connectionAttemptTimeout", () => {
   it("ignores disabled transport layer timeouts", () => {
     expect(
       connectionAttemptTimeoutMs({
-        db_type: "mysql",
+        db_type: "postgres",
         connect_timeout_secs: 5,
         transport_layers: [
           {

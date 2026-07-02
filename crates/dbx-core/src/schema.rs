@@ -3,12 +3,20 @@ use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query::{agent_execute_query_params, should_discard_pool_after_error, QueryExecutionOptions};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod kingbase;
+
+const DATABASE_STATISTICS_TIMEOUT: Duration = Duration::from_secs(9);
+const MYSQL_AGENT_AUTOMATIC_DATABASE_STATISTICS_BUDGET: Duration = Duration::from_secs(2);
+
+/// Timeout for the manual, single-database size request (right-click action).
+/// Scanning one schema is much cheaper than the automatic all-database pass, so
+/// this can be far more generous — slow servers still finish for one database.
+const MANUAL_DATABASE_SIZE_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! extract_pool {
     ($connections:expr, $key:expr, $variant:ident) => {
@@ -185,7 +193,7 @@ pub fn duckdb_list_databases_with_attached(
     let rows = stmt
         .query_map([], |row| {
             let name = row.get::<_, String>(0)?;
-            Ok(db::DatabaseInfo { name: if name == primary { "main".to_string() } else { name } })
+            Ok(db::DatabaseInfo { name: if name == primary { "main".to_string() } else { name }, size_bytes: None })
         })
         .map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|row| row.ok()).collect())
@@ -782,6 +790,120 @@ pub async fn list_database_storage_core(
     }
 }
 
+pub async fn list_database_statistics_core(
+    state: &AppState,
+    connection_id: &str,
+) -> Result<Vec<db::DatabaseStatistics>, String> {
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        DATABASE_STATISTICS_TIMEOUT,
+        retry_metadata_connection(state, connection_id, None, || list_database_statistics_once(state, connection_id)),
+    )
+    .await;
+    match result {
+        Ok(Ok(statistics)) => {
+            log::info!(
+                "[list_database_statistics:done] connection_id={} count={} elapsed_ms={}",
+                connection_id,
+                statistics.len(),
+                start.elapsed().as_millis()
+            );
+            Ok(statistics)
+        }
+        Ok(Err(error)) => {
+            log::warn!(
+                "[list_database_statistics:failed] connection_id={} elapsed_ms={} error={}",
+                connection_id,
+                start.elapsed().as_millis(),
+                error
+            );
+            Err(error)
+        }
+        Err(_) => {
+            log::warn!(
+                "[list_database_statistics:timeout] connection_id={} timeout_ms={}",
+                connection_id,
+                DATABASE_STATISTICS_TIMEOUT.as_millis()
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Computes the size of a single database on demand (manual right-click action).
+///
+/// Unlike [`list_database_statistics_core`], which scans every database under a
+/// short budget and leaves sizes blank on timeout, this scopes to one database
+/// and allows [`MANUAL_DATABASE_SIZE_TIMEOUT`]. On timeout it returns `Ok(None)`
+/// so the caller can surface "unavailable" without treating it as an error.
+pub async fn database_size_core(state: &AppState, connection_id: &str, database: &str) -> Result<Option<i64>, String> {
+    enum SizePool {
+        Mysql(db::mysql::MySqlPool),
+        Postgres(deadpool_postgres::Pool),
+        Unsupported,
+    }
+
+    let db_config = connection_config(state, connection_id).await;
+
+    // JDBC/Agent-backed MySQL uses a separate code path (no native pool). Apply
+    // the same permission/completeness protection as the native driver.
+    if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Mysql) {
+        let connections = state.connections.read().await;
+        if let Some(client) = extract_pool!(&connections, connection_id, Agent) {
+            drop(connections);
+            let current_database = db_config.as_ref().and_then(|config| config.database.as_deref());
+            let agent_timeout = agent_metadata_timeout(db_config.as_ref());
+            return match tokio::time::timeout(
+                MANUAL_DATABASE_SIZE_TIMEOUT,
+                mysql_agent_database_size(client, database, current_database, agent_timeout),
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_) => {
+                    log::warn!(
+                        "[database_size:timeout] connection_id={connection_id} timeout_ms={} (agent mysql)",
+                        MANUAL_DATABASE_SIZE_TIMEOUT.as_millis()
+                    );
+                    Ok(None)
+                }
+            };
+        }
+    }
+
+    let pool = {
+        let connections = state.connections.read().await;
+        match connections.get(connection_id).ok_or("Connection not found")? {
+            PoolKind::Mysql(_, mode) if *mode == MysqlMode::OceanBaseOracle => SizePool::Unsupported,
+            PoolKind::Mysql(_, _) if db_config.as_ref().is_some_and(is_doris_family_config) => SizePool::Unsupported,
+            PoolKind::Mysql(pool, _) => SizePool::Mysql(pool.clone()),
+            PoolKind::Postgres(pool) => SizePool::Postgres(pool.clone()),
+            _ => SizePool::Unsupported,
+        }
+    };
+
+    let database = database.to_string();
+    let result = tokio::time::timeout(MANUAL_DATABASE_SIZE_TIMEOUT, async move {
+        match pool {
+            SizePool::Mysql(pool) => db::mysql::database_size(&pool, &database, MANUAL_DATABASE_SIZE_TIMEOUT).await,
+            SizePool::Postgres(pool) => db::postgres::database_size(&pool, &database).await,
+            SizePool::Unsupported => Ok(None),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => {
+            log::warn!(
+                "[database_size:timeout] connection_id={connection_id} timeout_ms={}",
+                MANUAL_DATABASE_SIZE_TIMEOUT.as_millis()
+            );
+            Ok(None)
+        }
+    }
+}
+
 pub async fn list_sqlserver_linked_servers_core(
     state: &AppState,
     connection_id: &str,
@@ -1071,7 +1193,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         let connections = state.connections.read().await;
         #[cfg(feature = "duckdb-bundled")]
         if extract_pool!(&connections, connection_id, ExternalTabular).is_some() {
-            return Ok(vec![db::DatabaseInfo { name: "main".to_string() }]);
+            return Ok(vec![db::DatabaseInfo { name: "main".to_string(), size_bytes: None }]);
         }
         if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(connection_id) {
             let config = config.clone();
@@ -1100,7 +1222,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
             if is_mongo {
                 drop(connections);
                 let dbs = crate::mongo_ops::mongo_list_databases_core(state, connection_id).await?;
-                return Ok(dbs.into_iter().map(|name| db::DatabaseInfo { name }).collect());
+                return Ok(dbs.into_iter().map(|name| db::DatabaseInfo { name, size_bytes: None }).collect());
             }
             drop(connections);
             let mut client = client.lock().await;
@@ -1137,6 +1259,331 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         }
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_databases(client).await,
         _ => Ok(vec![]),
+    }
+}
+
+async fn list_database_statistics_once(
+    state: &AppState,
+    connection_id: &str,
+) -> Result<Vec<db::DatabaseStatistics>, String> {
+    log::info!("[list_database_statistics] connection_id={connection_id}");
+    let db_config = connection_config(state, connection_id).await;
+    // Restrict the expensive size scan to the configured visible databases
+    // (Some = filter enabled, mirroring the frontend visible_databases
+    // semantics; an empty list hides everything). Hidden databases must not be
+    // scanned at all.
+    let visible_databases: Option<Vec<String>> = db_config.as_ref().and_then(|config| config.visible_databases.clone());
+    if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Mysql) {
+        let connections = state.connections.read().await;
+        if let Some(client) = extract_pool!(&connections, connection_id, Agent) {
+            drop(connections);
+            return mysql_agent_list_database_statistics(
+                client,
+                db_config.as_ref().and_then(|config| config.database.as_deref()),
+                None,
+                visible_databases.as_deref(),
+            )
+            .await;
+        }
+    }
+    enum StatisticsPool {
+        Mysql(db::mysql::MySqlPool),
+        Postgres(deadpool_postgres::Pool),
+        Unsupported,
+    }
+
+    // Clone the pool handle before awaiting database I/O. Holding the
+    // connections read lock here blocks creation of tab-scoped query pools,
+    // which can make opening a table spin until this optional query finishes.
+    let pool = {
+        let connections = state.connections.read().await;
+        match connections.get(connection_id).ok_or("Connection not found")? {
+            PoolKind::Mysql(_, mode) if *mode == MysqlMode::OceanBaseOracle => StatisticsPool::Unsupported,
+            PoolKind::Mysql(_, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
+                StatisticsPool::Unsupported
+            }
+            PoolKind::Mysql(pool, _) => StatisticsPool::Mysql(pool.clone()),
+            PoolKind::Postgres(pool) => StatisticsPool::Postgres(pool.clone()),
+            _ => StatisticsPool::Unsupported,
+        }
+    };
+
+    match pool {
+        StatisticsPool::Mysql(pool) => db::mysql::list_database_statistics(&pool, visible_databases.as_deref()).await,
+        StatisticsPool::Postgres(pool) => {
+            db::postgres::list_database_statistics(&pool, visible_databases.as_deref()).await
+        }
+        StatisticsPool::Unsupported => Ok(vec![]),
+    }
+}
+
+async fn mysql_agent_execute_statistics_rows(
+    client: &mut db::agent_driver::AgentDriverClient,
+    sql: &str,
+    database: Option<&str>,
+    query_timeout: Duration,
+) -> Result<db::QueryResult, String> {
+    let query_timeout_secs = query_timeout.as_secs().max(1);
+    let params = agent_execute_query_params(
+        sql,
+        database,
+        None,
+        QueryExecutionOptions { max_rows: Some(10_000), timeout_secs: Some(query_timeout_secs), ..Default::default() },
+    );
+    client.execute_query_with_timeout::<db::QueryResult>(params, Some(query_timeout)).await
+}
+
+fn remaining_agent_statistics_query_timeout(statistics_deadline: Instant) -> Option<Duration> {
+    statistics_deadline.checked_duration_since(Instant::now()).filter(|remaining| !remaining.is_zero())
+}
+
+/// Detects whether the agent's current MySQL user has full statistics visibility.
+///
+/// Mirrors the native driver's protection: `information_schema.TABLES` only
+/// returns rows for objects the user can see, so without this a user with
+/// partial table privileges would have a truncated sum reported as the full
+/// database size. Returns `(has_global, per_schema_privileged)`. Best-effort:
+/// on query failure we assume no privilege, which keeps sizes NULL rather than
+/// reporting an incomplete value.
+async fn mysql_agent_statistics_privileges(
+    client: &mut db::agent_driver::AgentDriverClient,
+    database: Option<&str>,
+    statistics_deadline: Instant,
+) -> (bool, HashSet<String>) {
+    let query_timeout = match remaining_agent_statistics_query_timeout(statistics_deadline) {
+        Some(timeout) => timeout,
+        None => return (false, HashSet::new()),
+    };
+    let mut has_global = match mysql_agent_execute_statistics_rows(
+        client,
+        db::mysql::mysql_global_database_statistics_privilege_sql(),
+        database,
+        query_timeout,
+    )
+    .await
+    {
+        Ok(result) => mysql_agent_privilege_flag(&result),
+        Err(err) => {
+            log::debug!("Unable to read MySQL agent global statistics privileges; sizes will remain NULL: {err}");
+            false
+        }
+    };
+    if !has_global {
+        // MySQL 8: privileges granted through enabled roles. ENABLED_ROLES does
+        // not exist on 5.7/MariaDB; failure is expected there and ignored.
+        let query_timeout = match remaining_agent_statistics_query_timeout(statistics_deadline) {
+            Some(timeout) => timeout,
+            None => return (false, HashSet::new()),
+        };
+        has_global = match mysql_agent_execute_statistics_rows(
+            client,
+            db::mysql::mysql_global_database_statistics_role_privilege_sql(),
+            database,
+            query_timeout,
+        )
+        .await
+        {
+            Ok(result) => mysql_agent_privilege_flag(&result),
+            Err(err) => {
+                log::trace!("MySQL agent role-based global statistics privilege check unsupported: {err}");
+                false
+            }
+        };
+    }
+    if has_global {
+        return (true, HashSet::new());
+    }
+    let query_timeout = match remaining_agent_statistics_query_timeout(statistics_deadline) {
+        Some(timeout) => timeout,
+        None => return (false, HashSet::new()),
+    };
+    let mut schema_privileges = match mysql_agent_execute_statistics_rows(
+        client,
+        db::mysql::mysql_schema_database_statistics_privileges_sql(),
+        database,
+        query_timeout,
+    )
+    .await
+    {
+        Ok(result) => mysql_agent_schema_privilege_set(result),
+        Err(err) => {
+            log::debug!("Unable to read MySQL agent schema statistics privileges; sizes will remain NULL: {err}");
+            HashSet::new()
+        }
+    };
+    let query_timeout = match remaining_agent_statistics_query_timeout(statistics_deadline) {
+        Some(timeout) => timeout,
+        None => return (false, schema_privileges),
+    };
+    match mysql_agent_execute_statistics_rows(
+        client,
+        db::mysql::mysql_schema_database_statistics_role_privileges_sql(),
+        database,
+        query_timeout,
+    )
+    .await
+    {
+        Ok(result) => schema_privileges.extend(mysql_agent_schema_privilege_set(result)),
+        Err(err) => {
+            log::trace!("MySQL agent role-based schema statistics privilege check unsupported: {err}");
+        }
+    }
+    (false, schema_privileges)
+}
+
+fn mysql_agent_privilege_flag(result: &db::QueryResult) -> bool {
+    result.rows.first().and_then(|row| row.first()).and_then(json_value_as_i64).unwrap_or(0) != 0
+}
+
+fn mysql_agent_schema_privilege_set(result: db::QueryResult) -> HashSet<String> {
+    result
+        .rows
+        .into_iter()
+        .filter_map(|row| row.first().and_then(json_value_as_string).map(|schema| schema.trim().to_string()))
+        .filter(|schema| !schema.is_empty())
+        .collect()
+}
+
+async fn mysql_agent_list_database_statistics(
+    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    database: Option<&str>,
+    automatic_statistics_timeout: Option<Duration>,
+    visible_databases: Option<&[String]>,
+) -> Result<Vec<db::DatabaseStatistics>, String> {
+    // Visible filter enabled with an empty list hides every database; skip the
+    // scan entirely instead of issuing `IN ()`.
+    if visible_databases.is_some_and(|names| names.is_empty()) {
+        return Ok(vec![]);
+    }
+    let mut client = client.lock().await;
+    // This automatic pass is optional decoration in the sidebar. All permission
+    // probes and the aggregate share one short budget because metadata browsing
+    // uses the same agent client lock.
+    let automatic_statistics_budget =
+        automatic_statistics_timeout.unwrap_or(MYSQL_AGENT_AUTOMATIC_DATABASE_STATISTICS_BUDGET);
+    let statistics_deadline = Instant::now() + automatic_statistics_budget;
+    let (has_global, schema_privileges) =
+        mysql_agent_statistics_privileges(&mut client, database, statistics_deadline).await;
+    let query_timeout = match remaining_agent_statistics_query_timeout(statistics_deadline) {
+        Some(timeout) => timeout,
+        None => return Ok(vec![]),
+    };
+    let result = mysql_agent_execute_statistics_rows(
+        &mut client,
+        &mysql_agent_database_statistics_sql(visible_databases),
+        database,
+        query_timeout,
+    )
+    .await?;
+    let raw = mysql_agent_database_statistics_from_query_result(result);
+    Ok(apply_mysql_agent_statistics_protection(raw, has_global, &schema_privileges))
+}
+
+/// Nulls out sizes for schemas the current user lacks full statistics privilege
+/// on, so a privilege-truncated `information_schema.TABLES` sum is never
+/// reported as a complete database size. Pure so it can be unit-tested.
+fn apply_mysql_agent_statistics_protection(
+    raw: Vec<db::DatabaseStatistics>,
+    has_global: bool,
+    schema_privileges: &HashSet<String>,
+) -> Vec<db::DatabaseStatistics> {
+    raw.into_iter()
+        .map(|statistics| {
+            let has_full = has_global || schema_privileges.contains(&statistics.name);
+            db::DatabaseStatistics {
+                size_bytes: db::mysql::mysql_database_statistics_size(has_full, statistics.size_bytes),
+                name: statistics.name,
+            }
+        })
+        .collect()
+}
+
+/// Single-database size via the agent (manual right-click), with the same
+/// completeness protection as [`mysql_agent_list_database_statistics`].
+async fn mysql_agent_database_size(
+    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    database: &str,
+    current_database: Option<&str>,
+    timeout_duration: Option<Duration>,
+) -> Result<Option<i64>, String> {
+    let mut client = client.lock().await;
+    let manual_statistics_budget =
+        timeout_duration.unwrap_or(MANUAL_DATABASE_SIZE_TIMEOUT).min(MANUAL_DATABASE_SIZE_TIMEOUT);
+    let statistics_deadline = Instant::now() + manual_statistics_budget;
+    let (has_global, schema_privileges) =
+        mysql_agent_statistics_privileges(&mut client, current_database, statistics_deadline).await;
+    if !(has_global || schema_privileges.contains(database)) {
+        return Ok(None);
+    }
+    let query_timeout = match remaining_agent_statistics_query_timeout(statistics_deadline) {
+        Some(timeout) => timeout,
+        None => return Ok(None),
+    };
+    // Align MAX_EXECUTION_TIME with the remaining manual budget (not the 8s auto pass).
+    let max_execution_time_ms = query_timeout.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+    let sql = db::mysql::mysql_database_size_by_schema_sql_with_max_execution_time(
+        &[database.to_string()],
+        max_execution_time_ms,
+    );
+    let result = mysql_agent_execute_statistics_rows(&mut client, &sql, current_database, query_timeout).await?;
+    let statistics =
+        mysql_agent_database_statistics_from_query_result(result).into_iter().find(|entry| entry.name == database);
+    Ok(match statistics {
+        // Empty schema with full privilege → 0 B; incomplete SIZE_BYTES stays None.
+        None => Some(0),
+        Some(entry) => entry.size_bytes,
+    })
+}
+
+fn mysql_agent_database_statistics_sql(visible_databases: Option<&[String]>) -> String {
+    let visible_filter = match visible_databases {
+        Some(names) if !names.is_empty() => {
+            let list = names.iter().map(|name| sql_string_literal(name)).collect::<Vec<_>>().join(", ");
+            format!(" AND TABLE_SCHEMA IN ({list})")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "SELECT TABLE_SCHEMA AS name, \
+                CASE WHEN COUNT(*) = COUNT(DATA_LENGTH + INDEX_LENGTH) \
+                     THEN SUM(DATA_LENGTH + INDEX_LENGTH) \
+                     ELSE NULL END AS size_bytes \
+         FROM information_schema.TABLES \
+         WHERE TABLE_TYPE <> 'VIEW'{visible_filter} \
+         GROUP BY TABLE_SCHEMA \
+         ORDER BY TABLE_SCHEMA"
+    )
+}
+
+fn mysql_agent_database_statistics_from_query_result(result: db::QueryResult) -> Vec<db::DatabaseStatistics> {
+    result
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let name = row.first().and_then(json_value_as_string)?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let size_bytes = row.get(1).and_then(json_value_as_i64);
+            Some(db::DatabaseStatistics { name, size_bytes })
+        })
+        .collect()
+}
+
+fn json_value_as_string(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn json_value_as_i64(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(value) => {
+            value.as_i64().or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        }
+        serde_json::Value::String(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
     }
 }
 
@@ -2844,10 +3291,12 @@ fn escape_presto_like_pattern(value: &str) -> String {
 mod tests {
     use super::db;
     use super::{
-        clickhouse_metadata_database, dameng_object_statistics_dba_segments_sql,
-        dameng_object_statistics_rows_only_sql, dameng_object_statistics_user_segments_sql, deduplicate_column_infos,
-        filter_mysql_system_databases_for_config, filter_object_infos, filter_table_infos, filter_visible_schema_names,
-        gbase8a_object_statistics_sql, is_agent_postgres_metadata_fallback_config, is_retryable_metadata_error,
+        apply_mysql_agent_statistics_protection, clickhouse_metadata_database,
+        dameng_object_statistics_dba_segments_sql, dameng_object_statistics_rows_only_sql,
+        dameng_object_statistics_user_segments_sql, deduplicate_column_infos, filter_mysql_system_databases_for_config,
+        filter_object_infos, filter_table_infos, filter_visible_schema_names, gbase8a_object_statistics_sql,
+        is_agent_postgres_metadata_fallback_config, is_retryable_metadata_error,
+        mysql_agent_database_statistics_from_query_result, mysql_agent_database_statistics_sql,
         mysql_object_source_sql, mysql_table_metadata_catalog, normalize_information_schema_table_type,
         oracle_columns_from_query_result, oracle_columns_sql, oracle_object_statistics_dba_segments_sql,
         oracle_object_statistics_from_query_result, oracle_object_statistics_rows_only_sql,
@@ -2863,7 +3312,7 @@ mod tests {
         duckdb_object_source_with_attached, duckdb_query_tables_in_database,
     };
     use crate::models::connection::{ConnectionConfig, DatabaseType};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn test_column(name: &str, comment: Option<&str>, is_primary_key: bool) -> super::db::ColumnInfo {
         super::db::ColumnInfo {
@@ -2940,6 +3389,78 @@ mod tests {
     fn mysql_table_child_metadata_prefers_schema_when_present() {
         assert_eq!(mysql_table_metadata_catalog("app_db", ""), "app_db");
         assert_eq!(mysql_table_metadata_catalog("app_db", "tenant_db"), "tenant_db");
+    }
+
+    #[test]
+    fn mysql_agent_database_statistics_sql_applies_visible_database_scope() {
+        let unfiltered = mysql_agent_database_statistics_sql(None);
+        assert!(!unfiltered.contains("TABLE_SCHEMA IN"));
+
+        let filtered = mysql_agent_database_statistics_sql(Some(&["app".to_string(), "we'ird".to_string()]));
+        assert!(filtered.contains("TABLE_SCHEMA IN ('app', 'we''ird')"));
+    }
+
+    #[test]
+    fn mysql_agent_database_statistics_maps_query_result() {
+        let sql = mysql_agent_database_statistics_sql(None);
+        assert!(sql.contains("information_schema.TABLES"));
+        assert!(sql.contains("DATA_LENGTH"));
+        assert!(sql.contains("INDEX_LENGTH"));
+        assert!(sql.contains("COUNT(*) = COUNT(DATA_LENGTH + INDEX_LENGTH)"));
+        assert!(sql.contains("THEN SUM(DATA_LENGTH + INDEX_LENGTH)"));
+        assert!(!sql.contains("COALESCE(DATA_LENGTH"));
+
+        let result = db::QueryResult {
+            columns: vec!["name".to_string(), "size_bytes".to_string()],
+            column_types: vec![],
+            column_sortables: vec![],
+            rows: vec![
+                vec![serde_json::json!("app_db"), serde_json::json!(4096)],
+                vec![serde_json::json!("metrics"), serde_json::json!("8192")],
+                vec![serde_json::json!(""), serde_json::json!(1)],
+                vec![serde_json::json!("overflow"), serde_json::json!("not-a-number")],
+            ],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        };
+
+        let statistics = mysql_agent_database_statistics_from_query_result(result);
+        assert_eq!(statistics.len(), 3);
+        assert_eq!(statistics[0].name, "app_db");
+        assert_eq!(statistics[0].size_bytes, Some(4096));
+        assert_eq!(statistics[1].name, "metrics");
+        assert_eq!(statistics[1].size_bytes, Some(8192));
+        assert_eq!(statistics[2].name, "overflow");
+        assert_eq!(statistics[2].size_bytes, None);
+    }
+
+    #[test]
+    fn mysql_agent_statistics_protection_nulls_sizes_without_full_privilege() {
+        let raw = vec![
+            db::DatabaseStatistics { name: "app_db".to_string(), size_bytes: Some(4096) },
+            db::DatabaseStatistics { name: "metrics".to_string(), size_bytes: Some(8192) },
+        ];
+
+        // Global statistics privilege: every visible size is trusted as complete.
+        let global = apply_mysql_agent_statistics_protection(raw.clone(), true, &HashSet::new());
+        assert_eq!(global[0].size_bytes, Some(4096));
+        assert_eq!(global[1].size_bytes, Some(8192));
+
+        // Only per-schema privilege on "app_db": "metrics" may be a truncated
+        // partial-visibility sum, so it must be reported as unknown, not wrong.
+        let mut privileged = HashSet::new();
+        privileged.insert("app_db".to_string());
+        let scoped = apply_mysql_agent_statistics_protection(raw.clone(), false, &privileged);
+        assert_eq!(scoped[0].size_bytes, Some(4096));
+        assert_eq!(scoped[1].size_bytes, None);
+
+        // No statistics privilege at all: nothing is trusted.
+        let none = apply_mysql_agent_statistics_protection(raw, false, &HashSet::new());
+        assert_eq!(none[0].size_bytes, None);
+        assert_eq!(none[1].size_bytes, None);
     }
 
     #[test]
@@ -3068,7 +3589,7 @@ mod tests {
     }
 
     fn test_database_info(name: &str) -> super::db::DatabaseInfo {
-        super::db::DatabaseInfo { name: name.to_string() }
+        super::db::DatabaseInfo { name: name.to_string(), size_bytes: None }
     }
 
     #[test]

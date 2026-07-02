@@ -108,6 +108,15 @@ export function supportsTableStructureEditing(dbType?: DatabaseType): boolean {
   return supportsDatabaseFeature(dbType, "tableStructureEdit") && canEditTableStructure(dbType);
 }
 
+const DATABASE_SIZE_SUPPORTED_TYPES = new Set<DatabaseType>(["mysql", "postgres", "gaussdb", "kwdb", "opengauss"]);
+
+/** Matches the native/Agent dispatch implemented by database_size_core. */
+export function connectionSupportsDatabaseSize(config?: ConnectionConfig): boolean {
+  if (!config || config.db_type === "jdbc") return false;
+  if (connectionIsDorisFamilyCatalogCapable(config)) return false;
+  return DATABASE_SIZE_SUPPORTED_TYPES.has(config.db_type);
+}
+
 export function supportsDatabaseCreation(dbType?: DatabaseType): boolean {
   return supportsDatabaseFeature(dbType, "databaseCreate");
 }

@@ -1873,6 +1873,8 @@ export default {
     finalProxyPortCopied: "Final proxy port {port} copied",
     setDefaultDatabase: "Set as Default Database",
     clearDefaultDatabase: "Clear Default Database",
+    fetchDatabaseSize: "Fetch Database Size",
+    fetchDatabaseSizeFailed: "Failed to fetch database size: {message}",
     exportDatabase: "Export Database",
     exportAllDatabases: "Export All Databases",
     exportDatabaseSuccess: "Exported {count} tables, up to {limit} rows each",
@@ -4118,7 +4120,7 @@ export default {
     sidebarTableSearchEnabledDescription: "Show a local table search box under expanded databases, schemas, or table groups so each scope can filter tables independently.",
     sidebarObjectInfoMode: "Sidebar supplementary info",
     sidebarObjectInfoModeDescription:
-      "Choose comments, object sizes, or no supplementary text after names. Comments and sizes are mutually exclusive. Database totals currently support PostgreSQL; table sizes support MySQL, PostgreSQL, GaussDB, Kingbase, GBase 8a, SQL Server, Oracle, Dameng, and ClickHouse.",
+      "Choose comments, object sizes, or no supplementary text after names. Comments and table sizes are mutually exclusive. Database totals show automatically in the sidebar (MySQL, PostgreSQL, GaussDB, KWDB, openGauss); table sizes support MySQL, PostgreSQL, GaussDB, Kingbase, GBase 8a, SQL Server, Oracle, Dameng, and ClickHouse.",
     sidebarObjectInfoModeCommentInline: "Comments (after name)",
     sidebarObjectInfoModeCommentAligned: "Comments (align siblings)",
     sidebarObjectInfoModeCommentRight: "Comments (align right)",

@@ -353,6 +353,12 @@ export interface JdbcPluginStatus {
 
 export interface DatabaseInfo {
   name: string;
+  size_bytes?: number | null;
+}
+
+export interface DatabaseStatistics {
+  name: string;
+  size_bytes: number | null;
 }
 
 export interface DatabaseStorageInfo {

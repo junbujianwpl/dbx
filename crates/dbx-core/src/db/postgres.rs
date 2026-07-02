@@ -26,8 +26,8 @@ use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
     CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
-    DatabaseStorageInfo, ExtensionInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo, ObjectStatistics,
-    OwnerInfo, QueryResult, RuleInfo, SchemaInfo, SequenceInfo, TableInfo, TriggerInfo,
+    DatabaseStatistics, DatabaseStorageInfo, ExtensionInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo,
+    ObjectStatistics, OwnerInfo, QueryResult, RuleInfo, SchemaInfo, SequenceInfo, TableInfo, TriggerInfo,
 };
 
 fn pg_temporal_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
@@ -1684,7 +1684,76 @@ pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let rows = postgres_query_cached(&client, list_databases_sql(), &[]).await.map_err(|e| e.to_string())?;
 
-    Ok(rows.iter().map(|row| DatabaseInfo { name: pg_row_try_string(row, 0) }).collect())
+    Ok(rows.iter().map(|row| DatabaseInfo { name: pg_row_try_string(row, 0), size_bytes: None }).collect())
+}
+
+pub async fn list_database_statistics(
+    pool: &Pool,
+    visible_databases: Option<&[String]>,
+) -> Result<Vec<DatabaseStatistics>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    // Restrict the pg_database_size() pass to the configured visible databases
+    // (Some = filter enabled, mirroring the frontend) so hidden databases are
+    // never sized.
+    let rows = match visible_databases {
+        Some(names) => {
+            let names: Vec<String> = names.to_vec();
+            postgres_query_cached(&client, list_database_statistics_visible_sql(), &[&names])
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        None => postgres_query_cached(&client, list_database_statistics_sql(), &[]).await.map_err(|e| e.to_string())?,
+    };
+
+    Ok(rows
+        .iter()
+        .map(|row| DatabaseStatistics {
+            name: pg_row_try_string(row, 0),
+            size_bytes: row.try_get::<_, Option<i64>>(1).ok().flatten(),
+        })
+        .collect())
+}
+
+fn list_database_statistics_sql() -> &'static str {
+    "SELECT datname, \
+            CASE WHEN has_database_privilege(datname, 'CONNECT') \
+                 THEN pg_database_size(oid) \
+                 ELSE NULL END AS size_bytes \
+     FROM pg_database \
+     WHERE datallowconn = true \
+     ORDER BY datname"
+}
+
+fn list_database_statistics_visible_sql() -> &'static str {
+    "SELECT datname, \
+            CASE WHEN has_database_privilege(datname, 'CONNECT') \
+                 THEN pg_database_size(oid) \
+                 ELSE NULL END AS size_bytes \
+     FROM pg_database \
+     WHERE datallowconn = true \
+       AND datname = ANY($1) \
+     ORDER BY datname"
+}
+
+/// Computes the size of a single database on demand (manual right-click action).
+///
+/// Mirrors [`list_database_statistics`] but scoped to one `datname`, so the
+/// caller can apply a longer timeout without scanning every database. Keeps the
+/// `has_database_privilege(..., 'CONNECT')` guard so a low-privilege account
+/// gets `None` instead of failing the query.
+pub async fn database_size(pool: &Pool, database: &str) -> Result<Option<i64>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = postgres_query_cached(&client, database_size_sql(), &[&database]).await.map_err(|e| e.to_string())?;
+    Ok(rows.first().and_then(|row| row.try_get::<_, Option<i64>>(0).ok().flatten()))
+}
+
+fn database_size_sql() -> &'static str {
+    "SELECT CASE WHEN has_database_privilege(datname, 'CONNECT') \
+                 THEN pg_database_size(oid) \
+                 ELSE NULL END AS size_bytes \
+     FROM pg_database \
+     WHERE datallowconn = true \
+       AND datname = $1"
 }
 
 pub async fn list_database_storage(pool: &Pool, database_names: &[String]) -> Result<Vec<DatabaseStorageInfo>, String> {
@@ -3944,6 +4013,40 @@ mod tests {
         assert_eq!(classify_pg_type("int4"), PgColType::Other);
         assert_eq!(classify_pg_type("varchar"), PgColType::Other);
         assert_eq!(classify_pg_type(""), PgColType::Other);
+    }
+
+    #[test]
+    fn postgres_list_databases_sql_does_not_load_database_sizes() {
+        let sql = list_databases_sql();
+
+        assert!(sql.contains("pg_database"));
+        assert!(!sql.contains("pg_database_size"));
+    }
+
+    #[test]
+    fn postgres_database_statistics_sql_loads_sizes_separately() {
+        let sql = list_database_statistics_sql();
+
+        assert!(sql.contains("pg_database_size"));
+        assert!(sql.contains("has_database_privilege"));
+    }
+
+    #[test]
+    fn postgres_database_statistics_visible_sql_scopes_to_visible_databases() {
+        let sql = list_database_statistics_visible_sql();
+
+        assert!(sql.contains("pg_database_size"));
+        assert!(sql.contains("has_database_privilege"));
+        assert!(sql.contains("datname = ANY($1)"));
+    }
+
+    #[test]
+    fn postgres_database_size_sql_scopes_to_one_database_with_privilege_guard() {
+        let sql = database_size_sql();
+
+        assert!(sql.contains("pg_database_size"));
+        assert!(sql.contains("has_database_privilege"));
+        assert!(sql.contains("datname = $1"));
     }
 
     struct DockerPostgres {

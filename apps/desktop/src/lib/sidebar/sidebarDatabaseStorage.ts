@@ -17,15 +17,17 @@ export function sidebarDatabaseNames(nodes: readonly TreeNode[] | undefined): st
   return nodes.flatMap((node) => (node.type === "database" && !node.catalog && node.database ? [node.database] : []));
 }
 
-export function applySidebarDatabaseStorage(nodes: readonly TreeNode[] | undefined, storage: readonly DatabaseStorageInfo[]): boolean {
+export function applySidebarDatabaseStorage(nodes: TreeNode[] | undefined, storage: readonly DatabaseStorageInfo[]): boolean {
   if (!nodes?.length || !storage.length) return false;
   const byName = new Map(storage.map((item) => [item.name, item.size_bytes] as const));
   let changed = false;
-  for (const node of nodes) {
+  for (let index = 0; index < nodes.length; index++) {
+    const node = nodes[index];
     if (node.type !== "database" || node.catalog || !node.database || !byName.has(node.database)) continue;
     const sizeBytes = byName.get(node.database) ?? null;
     if (node.sizeBytes === sizeBytes) continue;
-    node.sizeBytes = sizeBytes;
+    // Replace the node object so virtualized TreeItem rows pick up sizeBytes.
+    nodes[index] = { ...node, sizeBytes };
     changed = true;
   }
   return changed;

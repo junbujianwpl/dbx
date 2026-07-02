@@ -626,9 +626,24 @@ function refreshTrailingCommentMeasurement() {
   }
 }
 
+const formattedObjectStorageText = computed(() => {
+  // Read sizeBytes from props.node (not the shallowRef copy) so recycled rows
+  // and in-place tree updates both invalidate this computed.
+  const type = props.node.type;
+  const sizeBytes = props.node.sizeBytes;
+  // Database sizes are loaded asynchronously (MySQL statistics / Postgres storage)
+  // and should remain visible whenever known — that is the sidebar database-size
+  // product. Table/materialized-view sizes stay behind the object-info "size" mode.
+  if (type === "database") {
+    return formatSidebarObjectStorage(sizeBytes);
+  }
+  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size") return "";
+  if (type !== "table" && type !== "materialized_view") return "";
+  return formatSidebarObjectStorage(sizeBytes);
+});
+
 function formattedObjectStorage(): string {
-  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size" || (activeNode.value.type !== "database" && activeNode.value.type !== "table" && activeNode.value.type !== "materialized_view")) return "";
-  return formatSidebarObjectStorage(activeNode.value.sizeBytes);
+  return formattedObjectStorageText.value;
 }
 
 const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" ? props.commentLabelWidth : undefined));

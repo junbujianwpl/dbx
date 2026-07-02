@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { connectionNamespaceCreationTarget, databaseNodeNamespaceCreationTarget } from "@/lib/database/databaseNamespaceCreation";
 import { editableDatabasePropertyGroups, editableSchemaPropertyGroups } from "@/lib/database/databasePropertyEditing";
 import { buildGetDatabaseCommentSql } from "@/lib/database/dbAdminSql";
-import { isSchemaAware, supportsDatabaseSchemaQualifier, supportsSqlInListPaste, supportsTransaction } from "@/lib/database/databaseFeatureSupport";
+import { connectionSupportsDatabaseSize, isSchemaAware, supportsDatabaseSchemaQualifier, supportsSqlInListPaste, supportsTransaction } from "@/lib/database/databaseFeatureSupport";
 
 describe("schema awareness", () => {
   it("keeps SQLite database aliases separate from schema-capable databases", () => {
@@ -17,6 +17,22 @@ describe("database and schema qualifiers", () => {
 
   it.each(["mysql", "postgres", "oracle", "snowflake"] as const)("does not widen unverified three-part completion for %s", (databaseType) => {
     expect(supportsDatabaseSchemaQualifier(databaseType)).toBe(false);
+  });
+});
+
+describe("connectionSupportsDatabaseSize", () => {
+  it("matches the backend database-size dispatch", () => {
+    for (const db_type of ["mysql", "postgres", "gaussdb", "kwdb", "opengauss"] as const) {
+      expect(connectionSupportsDatabaseSize({ db_type } as any)).toBe(true);
+    }
+  });
+
+  it("excludes unsupported Agent and generic JDBC paths", () => {
+    for (const db_type of ["highgo", "vastbase", "kingbase"] as const) {
+      expect(connectionSupportsDatabaseSize({ db_type } as any)).toBe(false);
+    }
+    expect(connectionSupportsDatabaseSize({ db_type: "jdbc", connection_string: "jdbc:mysql://localhost/app" } as any)).toBe(false);
+    expect(connectionSupportsDatabaseSize({ db_type: "jdbc", connection_string: "jdbc:postgresql://localhost/app" } as any)).toBe(false);
   });
 });
 

@@ -54,6 +54,17 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     }
   }
 
+  async function fetchDatabaseSize() {
+    const node = activeNode.value;
+    if (!node.connectionId || !node.database) return;
+    try {
+      // null means unavailable (privilege/timeout) — expected, silent leave-blank.
+      await connectionStore.fetchDatabaseSize(node.connectionId, node.database);
+    } catch (error: any) {
+      toast(t("contextMenu.fetchDatabaseSizeFailed", { message: error?.message || String(error) }), 5000);
+    }
+  }
+
   function connectionDeleteTargets() {
     if (showDeleteConfirm.value && connectionDeleteTargetSnapshot.value.length) return connectionDeleteTargetSnapshot.value;
     return selectedConnectionDeleteTargets(activeNode.value, selectedTreeNodesInVisibleOrder());
@@ -289,6 +300,7 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
   return {
     setNodeAsDefaultDatabase,
     clearNodeDefaultDatabase,
+    fetchDatabaseSize,
     connectionDeleteTargets,
     connectionDeleteMenuLabel,
     connectionDuplicateTargets,
